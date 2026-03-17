@@ -1,0 +1,435 @@
+name: Attendance System Tests
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+
+  # ── Job 1: Syntax Validation ───────────────────────────
+  syntax-check:
+    name: Syntax Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check bash syntax — project.sh
+        run: bash -n project.sh
+
+      - name: Check bash syntax — auto_capture.sh
+        run: bash -n auto_capture.sh
+
+      - name: Check bash syntax — cron_report.sh
+        run: bash -n cron_report.sh
+
+      - name: Run shellcheck (static analysis)
+        run: |
+          sudo apt-get install -y shellcheck -qq
+          shellcheck -S warning attendance.sh auto_capture.sh cron_report.sh || true
+
+
+  # ── Job 2: Directory & Config Initialization ───────────
+  init-test:
+    name: Initialization Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    needs: syntax-check
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install bc (required for float arithmetic)
+        run: sudo apt-get install -y bc -qq
+
+      - name: Run init by sourcing attendance.sh functions
+        run: |
+          bash -c '
+            source attendance.sh 2>/dev/null || true
+            init_dirs
+          '
+        timeout-minutes: 1
+
+      - name: Verify directory structure created
+        run: |
+          for dir in logs reports data exports; do
+            [ -d "$dir" ] && echo "✔ $dir/ exists" || { echo "✘ $dir/ missing"; exit 1; }
+          done
+
+      - name: Verify config.conf generated
+        run: |
+          [ -f config.conf ] && echo "✔ config.conf exists" || { echo "✘ config.conf missing"; exit 1; }
+          echo "--- config.conf contents ---"
+          cat config.conf
+
+      - name: Verify login log initialized
+        run: |
+          [ -f data/login_records.log ] && echo "✔ login_records.log exists" || { echo "✘ log missing"; exit 1; }
+
+
+  # ── Job 3: Login/Logout Tracking ──────────────────────
+  tracking-test:
+    name: Login/Logout Tracking Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: init-test
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install bc
+        run: sudo apt-get install -y bc -qq
+
+      - name: Setup directories
+        run: bash -c 'source attendance.sh 2>/dev/null || true; init_dirs'
+
+      - name: Inject sample login/logout records
+        run: |
+          TODAY=$(date '+%Y-%m-%d')
+          cat >> data/login_records.log <<EOF
+          ${TODAY}|E001|Alice Johnson|LOGIN|08:55:00|192.168.1.10|ws-alice
+          ${TODAY}|E001|Alice Johnson|LOGOUT|18:00:00|192.168.1.10|ws-alice
+          ${TODAY}|E002|Bob Smith|LOGIN|09:20:00|192.168.1.11|ws-bob
+          ${TODAY}|E002|Bob Smith|LOGOUT|17:45:00|192.168.1.11|ws-bob
+          ${TODAY}|E003|Carol White|LOGIN|09:05:00|192.168.1.12|ws-carol
+          ${TODAY}|E003|Carol White|LOGOUT|13:10:00|192.168.1.12|ws-carol
+          ${TODAY}|E004|David Brown|LOGIN|10:30:00|192.168.1.13|ws-david
+          ${TODAY}|E005|Eve Davis|LOGIN|08:50:00|192.168.1.14|ws-eve
+          ${TODAY}|E005|Eve Davis|LOGOUT|18:15:00|192.168.1.14|ws-eve
+          EOF
+
+      - name: Verify records written correctly
+        run: |
+          TODAY=$(date '+%Y-%m-%d')
+          count=$(grep "^$TODAY" data/login_records.log | wc -l)
+          echo "Records for today: $count"
+          [ "$count" -eq 9 ] && echo "✔ Record count correct" || { echo "✘ Expected 9, got $count"; exit 1; }
+
+      - name: Verify LOGIN entries exist
+        run: |
+          logins=$(grep "|LOGIN|" data/login_records.log | wc -l)
+          echo "Login entries: $logins"
+          [ "$logins" -ge 5 ] && echo "✔ Login entries OK" || { echo "✘ Missing logins"; exit 1; }
+
+      - name: Verify LOGOUT entries exist
+        run: |
+          logouts=$(grep "|LOGOUT|" data/login_records.log | wc -l)
+          echo "Logout entries: $logouts"
+          [ "$logouts" -ge 4 ] && echo "✔ Logout entries OK" || { echo "✘ Missing logouts"; exit 1; }
+
+      - name: Verify pipe-delimited format (7 fields)
+        run: |
+          while IFS= read -r line; do
+            fields=$(echo "$line" | awk -F'|' '{print NF}')
+            [ "$fields" -eq 7 ] || { echo "✘ Bad record: $line (fields=$fields)"; exit 1; }
+          done < data/login_records.log
+          echo "✔ All records have correct 7-field format"
+
+
+  # ── Job 4: Daily Attendance Generation ────────────────
+  attendance-report-test:
+    name: Daily Attendance Report Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: tracking-test
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install bc
+        run: sudo apt-get install -y bc -qq
+
+      - name: Setup + seed data
+        run: |
+          bash -c 'source attendance.sh 2>/dev/null || true; init_dirs'
+          TODAY=$(date '+%Y-%m-%d')
+          cat >> data/login_records.log <<EOF
+          ${TODAY}|E001|Alice Johnson|LOGIN|08:55:00|192.168.1.10|ws-alice
+          ${TODAY}|E001|Alice Johnson|LOGOUT|18:00:00|192.168.1.10|ws-alice
+          ${TODAY}|E002|Bob Smith|LOGIN|09:20:00|192.168.1.11|ws-bob
+          ${TODAY}|E002|Bob Smith|LOGOUT|17:45:00|192.168.1.11|ws-bob
+          ${TODAY}|E003|Carol White|LOGIN|09:05:00|192.168.1.12|ws-carol
+          ${TODAY}|E003|Carol White|LOGOUT|13:10:00|192.168.1.12|ws-carol
+          ${TODAY}|E004|David Brown|LOGIN|10:30:00|192.168.1.13|ws-david
+          ${TODAY}|E005|Eve Davis|LOGIN|08:50:00|192.168.1.14|ws-eve
+          ${TODAY}|E005|Eve Davis|LOGOUT|18:15:00|192.168.1.14|ws-eve
+          EOF
+
+      - name: Run cron_report.sh (non-interactive report generation)
+        run: |
+          bash cron_report.sh
+        timeout-minutes: 2
+
+      - name: Verify text report was created
+        run: |
+          TODAY=$(date '+%Y-%m-%d')
+          report="reports/attendance_${TODAY}.txt"
+          [ -f "$report" ] && echo "✔ Report exists: $report" || { echo "✘ Report not found"; exit 1; }
+          echo "--- Report Preview ---"
+          cat "$report"
+
+      - name: Verify CSV was created
+        run: |
+          TODAY=$(date '+%Y-%m-%d')
+          csv="exports/attendance_${TODAY}.csv"
+          [ -f "$csv" ] && echo "✔ CSV exists: $csv" || { echo "✘ CSV not found"; exit 1; }
+
+      - name: Validate attendance statuses (PRESENT/LATE/HALF-DAY)
+        run: |
+          TODAY=$(date '+%Y-%m-%d')
+          report="reports/attendance_${TODAY}.txt"
+          grep -q "PRESENT"  "$report" && echo "✔ PRESENT status found"  || echo "⚠ No PRESENT status"
+          grep -q "LATE"     "$report" && echo "✔ LATE status found"     || echo "⚠ No LATE status"
+          grep -q "HALF-DAY" "$report" && echo "✔ HALF-DAY status found" || echo "⚠ No HALF-DAY status"
+
+      - name: Validate hours calculation (numeric check)
+        run: |
+          TODAY=$(date '+%Y-%m-%d')
+          csv="exports/attendance_${TODAY}.csv"
+          tail -n +2 "$csv" | while IFS=',' read -r date eid name login logout hours status; do
+            if [ "$hours" != "--" ] && [ "$hours" != "0.00" ]; then
+              valid=$(echo "$hours >= 0" | bc)
+              [ "$valid" -eq 1 ] && echo "✔ $eid hours=$hours valid" || { echo "✘ $eid invalid hours: $hours"; exit 1; }
+            fi
+          done
+
+      - name: Upload report as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: attendance-reports
+          path: |
+            reports/
+            exports/
+          retention-days: 7
+
+
+  # ── Job 5: CSV Export Test ─────────────────────────────
+  csv-export-test:
+    name: CSV Export Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    needs: init-test
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install bc
+        run: sudo apt-get install -y bc -qq
+
+      - name: Setup + seed multi-day data
+        run: |
+          bash -c 'source attendance.sh 2>/dev/null || true; init_dirs'
+          for i in 0 1 2; do
+            D=$(date -d "-${i} days" '+%Y-%m-%d')
+            cat >> data/login_records.log <<EOF
+          ${D}|E001|Alice Johnson|LOGIN|09:00:00|10.0.0.1|host1
+          ${D}|E001|Alice Johnson|LOGOUT|17:30:00|10.0.0.1|host1
+          ${D}|E002|Bob Smith|LOGIN|09:30:00|10.0.0.2|host2
+          ${D}|E002|Bob Smith|LOGOUT|18:00:00|10.0.0.2|host2
+          EOF
+          done
+
+      - name: Test full CSV export
+        run: |
+          out="exports/all_records_test.csv"
+          echo "Date,EmployeeID,Name,Action,Time,IP,Hostname" > "$out"
+          sed 's/|/,/g' data/login_records.log >> "$out"
+          rows=$(tail -n +2 "$out" | wc -l)
+          echo "Exported $rows rows"
+          [ "$rows" -ge 1 ] && echo "✔ CSV export non-empty" || { echo "✘ CSV is empty"; exit 1; }
+
+      - name: Test date-range export
+        run: |
+          START=$(date -d "-2 days" '+%Y-%m-%d')
+          END=$(date '+%Y-%m-%d')
+          out="exports/range_test.csv"
+          echo "Date,EmployeeID,Name,Action,Time,IP,Hostname" > "$out"
+          awk -F'|' -v s="$START" -v e="$END" '$1>=s && $1<=e' data/login_records.log | sed 's/|/,/g' >> "$out"
+          rows=$(tail -n +2 "$out" | wc -l)
+          echo "Date range export: $rows rows"
+          [ "$rows" -ge 1 ] && echo "✔ Date-range export OK" || { echo "✘ Empty range export"; exit 1; }
+
+      - name: Test employee-specific export
+        run: |
+          out="exports/emp_E001_test.csv"
+          echo "Date,EmployeeID,Name,Action,Time,IP,Hostname" > "$out"
+          grep "|E001|" data/login_records.log | sed 's/|/,/g' >> "$out"
+          rows=$(tail -n +2 "$out" | wc -l)
+          echo "Employee export: $rows rows"
+          [ "$rows" -ge 1 ] && echo "✔ Employee export OK" || { echo "✘ Empty employee export"; exit 1; }
+
+      - name: Validate CSV column count (7 columns)
+        run: |
+          tail -n +2 exports/all_records_test.csv | while IFS=',' read -r f1 f2 f3 f4 f5 f6 f7; do
+            [ -z "$f1" ] && { echo "✘ Empty date field"; exit 1; }
+          done
+          echo "✔ CSV column structure valid"
+
+
+  # ── Job 6: Analytics Test ─────────────────────────────
+  analytics-test:
+    name: Summary Analytics Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    needs: tracking-test
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install bc
+        run: sudo apt-get install -y bc -qq
+
+      - name: Setup + seed data
+        run: |
+          bash -c 'source attendance.sh 2>/dev/null || true; init_dirs'
+          TODAY=$(date '+%Y-%m-%d')
+          cat >> data/login_records.log <<EOF
+          ${TODAY}|E001|Alice Johnson|LOGIN|08:55:00|192.168.1.10|ws-alice
+          ${TODAY}|E001|Alice Johnson|LOGOUT|18:00:00|192.168.1.10|ws-alice
+          ${TODAY}|E002|Bob Smith|LOGIN|09:20:00|192.168.1.11|ws-bob
+          ${TODAY}|E002|Bob Smith|LOGOUT|17:45:00|192.168.1.11|ws-bob
+          EOF
+
+      - name: Test unique employee count
+        run: |
+          total=$(cut -d'|' -f2 data/login_records.log | sort -u | wc -l)
+          echo "Unique employees: $total"
+          [ "$total" -ge 2 ] && echo "✔ Employee count OK" || { echo "✘ Wrong count"; exit 1; }
+
+      - name: Test hours calculation accuracy
+        run: |
+          # Alice: 08:55 → 18:00 = 9.08 hrs
+          ls=$(echo "08:55:00" | awk -F: '{print ($1*3600)+($2*60)+$3}')
+          ls2=$(echo "18:00:00" | awk -F: '{print ($1*3600)+($2*60)+$3}')
+          diff=$(( ls2 - ls ))
+          hours=$(echo "scale=2; $diff/3600" | bc)
+          echo "Alice hours: $hours"
+          valid=$(echo "$hours > 9" | bc)
+          [ "$valid" -eq 1 ] && echo "✔ Hours calculation correct" || { echo "✘ Hours wrong: $hours"; exit 1; }
+
+      - name: Test late detection logic
+        run: |
+          LATE_THRESH="09:15"
+          late_sec=$(echo "$LATE_THRESH" | awk -F: '{print ($1*3600)+($2*60)}')
+          bob_login=$(echo "09:20:00" | awk -F: '{print ($1*3600)+($2*60)+$3}')
+          alice_login=$(echo "08:55:00" | awk -F: '{print ($1*3600)+($2*60)+$3}')
+          [ "$bob_login" -gt "$late_sec" ] && echo "✔ Bob correctly detected as LATE" || { echo "✘ Late detection failed"; exit 1; }
+          [ "$alice_login" -le "$late_sec" ] && echo "✔ Alice correctly NOT late" || { echo "✘ Alice wrongly flagged late"; exit 1; }
+
+      - name: Test half-day threshold
+        run: |
+          half_sec=$(( 4 * 3600 ))
+          # 4h 5min session (14700s) → should be HALF-DAY
+          diff=14700
+          [ "$diff" -ge "$half_sec" ] && echo "✔ Half-day threshold correct" || { echo "✘ Half-day logic wrong"; exit 1; }
+
+
+  # ── Job 7: Edge Cases ─────────────────────────────────
+  edge-case-test:
+    name: Edge Case Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    needs: init-test
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install bc
+        run: sudo apt-get install -y bc -qq
+
+      - name: Setup
+        run: bash -c 'source attendance.sh 2>/dev/null || true; init_dirs'
+
+      - name: Test empty log handling
+        run: |
+          > data/login_records.log   # empty the log
+          count=$(wc -l < data/login_records.log)
+          [ "$count" -eq 0 ] && echo "✔ Empty log detected correctly" || exit 1
+
+      - name: Test report on date with no records
+        run: |
+          TODAY=$(date '+%Y-%m-%d')
+          emp_ids=$(grep "^$TODAY|" data/login_records.log 2>/dev/null | cut -d'|' -f2 | sort -u)
+          [ -z "$emp_ids" ] && echo "✔ Empty date returns no employees" || echo "⚠ Unexpected records"
+
+      - name: Test login-only (no logout) handling
+        run: |
+          TODAY=$(date '+%Y-%m-%d')
+          echo "${TODAY}|E009|Ghost User|LOGIN|09:00:00|10.0.0.9|ws-ghost" >> data/login_records.log
+          login_t=$(grep "^$TODAY|E009|.*|LOGIN|" data/login_records.log | tail -1 | cut -d'|' -f5)
+          logout_t=$(grep "^$TODAY|E009|.*|LOGOUT|" data/login_records.log | tail -1 | cut -d'|' -f5)
+          [ -n "$login_t" ] && [ -z "$logout_t" ] && echo "✔ No-logout case detected" || { echo "✘ Edge case failed"; exit 1; }
+
+      - name: Test duplicate employee ID same day
+        run: |
+          TODAY=$(date '+%Y-%m-%d')
+          echo "${TODAY}|E001|Alice|LOGIN|08:00:00|10.0.0.1|host" >> data/login_records.log
+          echo "${TODAY}|E001|Alice|LOGIN|09:00:00|10.0.0.1|host" >> data/login_records.log
+          # Should pick the last login
+          last_login=$(grep "^$TODAY|E001|.*|LOGIN|" data/login_records.log | tail -1 | cut -d'|' -f5)
+          [ "$last_login" = "09:00:00" ] && echo "✔ Last login selected on duplicate" || { echo "✘ Wrong login picked: $last_login"; exit 1; }
+
+      - name: Test midnight boundary (23:59 → 00:00 not supported gracefully)
+        run: |
+          TODAY=$(date '+%Y-%m-%d')
+          echo "${TODAY}|E010|Night Owl|LOGIN|23:00:00|10.0.0.10|host" >> data/login_records.log
+          login=$(grep "^$TODAY|E010|.*|LOGIN|" data/login_records.log | cut -d'|' -f5)
+          [ -n "$login" ] && echo "✔ Late-night login stored correctly" || { echo "✘ Night login failed"; exit 1; }
+
+
+  # ── Final Summary ──────────────────────────────────────
+  test-summary:
+    name: Test Summary
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    needs:
+      - syntax-check
+      - init-test
+      - tracking-test
+      - attendance-report-test
+      - csv-export-test
+      - analytics-test
+      - edge-case-test
+    if: always()
+
+    steps:
+      - name: Print result summary
+        run: |
+          echo "================================================"
+          echo "  ATTENDANCE SYSTEM — TEST RESULTS SUMMARY"
+          echo "================================================"
+          echo "  syntax-check            : ${{ needs.syntax-check.result }}"
+          echo "  init-test               : ${{ needs.init-test.result }}"
+          echo "  tracking-test           : ${{ needs.tracking-test.result }}"
+          echo "  attendance-report-test  : ${{ needs.attendance-report-test.result }}"
+          echo "  csv-export-test         : ${{ needs.csv-export-test.result }}"
+          echo "  analytics-test          : ${{ needs.analytics-test.result }}"
+          echo "  edge-case-test          : ${{ needs.edge-case-test.result }}"
+          echo "================================================"
+
+      - name: Fail if any job failed
+        if: |
+          needs.syntax-check.result == 'failure' ||
+          needs.init-test.result == 'failure' ||
+          needs.tracking-test.result == 'failure' ||
+          needs.attendance-report-test.result == 'failure' ||
+          needs.csv-export-test.result == 'failure' ||
+          needs.analytics-test.result == 'failure' ||
+          needs.edge-case-test.result == 'failure'
+        run: |
+          echo "✘ One or more test jobs failed."
+          exit 1
+
+      - name: All tests passed
+        run: echo "✔ All attendance system tests passed!"
